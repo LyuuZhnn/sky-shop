@@ -1,37 +1,60 @@
-/* Cart stays separate from account/session lifecycle. */
 (() => {
   'use strict';
-  const S = window.SkyStore, P = window.SkyProducts;
-  function raw() { return S.get('cart').filter(i => i && i.productId && Number.isInteger(i.qty) && i.qty > 0); }
-  function list() {
-    return raw().map(i => ({ ...i, product: P.byId(i.productId) })).filter(i => i.product);
-  }
-  function save(items) { const ok = S.set('cart', items); if (ok) window.dispatchEvent(new CustomEvent('sky:cart')); return ok; }
-  function add(id, qty=1) {
-    const product = P.byId(id); if (!product) return { ok:false, error:'Produk tidak ditemukan.' };
-    if (product.available === false || product.stock <= 0) return { ok:false, error:'Produk sedang tidak tersedia.' };
-    qty = Math.floor(Number(qty)); if (!Number.isFinite(qty) || qty < 1) return { ok:false, error:'Jumlah barang tidak valid.' };
-    const items = raw(); const current = items.find(i => i.productId === id); const target = (current ? current.qty : 0) + qty;
-    if (target > product.stock) return { ok:false, error:`Stok ${product.name} hanya ${product.stock} barang.` };
-    if (current) current.qty = target; else items.push({ productId:id, qty });
-    return save(items) ? {ok:true} : {ok:false,error:'Keranjang belum dapat disimpan.'};
-  }
-  function setQty(id, qty) {
-    const product = P.byId(id); qty = Math.floor(Number(qty));
-    if (!product) return {ok:false,error:'Produk tidak ditemukan.'};
-    if (!Number.isInteger(qty) || qty < 1) return remove(id) ? {ok:true} : {ok:false,error:'Perubahan tidak tersimpan.'};
-    if (qty > product.stock) return {ok:false,error:`Stok tersedia ${product.stock} barang.`};
-    const items = raw().map(i => i.productId === id ? {...i,qty} : i);
-    return save(items) ? {ok:true} : {ok:false,error:'Perubahan tidak tersimpan.'};
-  }
-  function remove(id) { return save(raw().filter(i => i.productId !== id)); }
-  function clear() { return save([]); }
-  function summary() { const items = list(); return { count:items.reduce((n,i)=>n+i.qty,0), subtotal:items.reduce((n,i)=>n+i.qty*i.product.price,0), items }; }
-  function validate() {
-    for (const item of list()) {
-      if (item.product.available === false || item.product.stock < item.qty) return `Stok ${item.product.name} berubah. Sesuaikan jumlah sebelum checkout.`;
-    }
-    return '';
-  }
-  window.SkyCart = { list, add, setQty, remove, clear, summary, validate };
+  const C = window.Crystal = window.Crystal || {};
+  C.cart = function () {
+    const rows = C.read(C.keys.cart, []);
+    if (!Array.isArray(rows)) return [];
+    const products = C.products();
+    return rows.filter(row => row && typeof row.productId === 'string').map(row => {
+      const product = products.find(p => p.id === row.productId);
+      return product ? { productId: product.id, quantity: Math.max(1, Math.min(Math.floor(Number(row.quantity) || 1), Math.max(1, product.stock))), product } : null;
+    }).filter(Boolean);
+  };
+  C.saveCart = rows => C.write(C.keys.cart, rows.map(row => ({ productId: row.productId, quantity: row.quantity })));
+  C.cartCount = () => C.cart().reduce((sum, row) => sum + row.quantity, 0);
+  C.cartSubtotal = () => C.cart().reduce((sum, row) => sum + row.product.price * row.quantity, 0);
+  C.addToCart = function (productId, quantity = 1) {
+    const product = C.getProduct(productId);
+    if (!product || !product.active) throw new Error('Produk tidak tersedia.');
+    const qty = Math.floor(Number(quantity));
+    if (!Number.isInteger(qty) || qty < 1) throw new Error('Jumlah barang tidak valid.');
+    if (product.stock < 1) throw new Error('Stok produk sedang habis.');
+    const rows = C.read(C.keys.cart, []);
+    const cart = Array.isArray(rows) ? rows.filter(row => row && typeof row.productId === 'string') : [];
+    const found = cart.find(row => row.productId === product.id);
+    const nextQuantity = (found ? Math.floor(Number(found.quantity) || 0) : 0) + qty;
+    if (nextQuantity > product.stock) throw new Error(`Stok tersedia hanya ${product.stock} unit.`);
+    if (found) found.quantity = nextQuantity; else cart.push({ productId: product.id, quantity: qty });
+    if (!C.saveCart(cart)) throw new Error('Keranjang gagal disimpan di browser.');
+    return true;
+  };
+  C.changeCartQuantity = function (productId, quantity) {
+    const product = C.getProduct(productId);
+    if (!product) throw new Error('Produk sudah tidak tersedia.');
+    const qty = Math.floor(Number(quantity));
+    const rows = C.read(C.keys.cart, []);
+    const cart = Array.isArray(rows) ? rows.filter(row => row && typeof row.productId === 'string') : [];
+    if (qty < 1) return C.removeFromCart(productId);
+    if (qty > product.stock) throw new Error(`Stok tersedia hanya ${product.stock} unit.`);
+    const found = cart.find(row => row.productId === product.id);
+    if (!found) return false;
+    found.quantity = qty;
+    if (!C.saveCart(cart)) throw new Error('Keranjang gagal disimpan di browser.');
+    return true;
+  };
+  C.removeFromCart = function (productId) {
+    const rows = C.read(C.keys.cart, []);
+    const next = (Array.isArray(rows) ? rows : []).filter(row => row && row.productId !== String(productId));
+    return C.saveCart(next);
+  };
+  C.clearCart = () => C.saveCart([]);
+  C.validateCart = function () {
+    const rows = C.cart();
+    if (!rows.length) throw new Error('Keranjang masih kosong.');
+    rows.forEach(({ product, quantity }) => {
+      if (!product.active || product.stock < 1) throw new Error(`${product.name} tidak tersedia saat ini.`);
+      if (quantity > product.stock) throw new Error(`Jumlah ${product.name} melebihi stok tersedia.`);
+    });
+    return rows;
+  };
 })();

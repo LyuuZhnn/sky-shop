@@ -1,47 +1,72 @@
-/* Local order history only; no server sync is implied. */
 (() => {
   'use strict';
-  const S = window.SkyStore, P = window.SkyProducts, C = window.SkyCart;
-  const STATUSES = ['Menunggu konfirmasi','Diproses','Dikirim','Selesai','Dibatalkan'];
-  function all() { return S.get('orders').filter(o => o && o.id && Array.isArray(o.items)); }
-  function byId(id) { return all().find(o => o.id === id) || null; }
-  function create(customer) {
-    const validation = C.validate(); if (validation) return {ok:false,error:validation};
-    const cart = C.summary(); if (!cart.items.length) return {ok:false,error:'Keranjang masih kosong.'};
-    const name = String(customer.name || '').trim(), phone = String(customer.phone || '').trim(), address = String(customer.address || '').trim();
-    if (name.length < 2) return {ok:false,error:'Nama pelanggan minimal 2 karakter.'};
-    if (!/^[+\d][\d\s().-]{7,19}$/.test(phone)) return {ok:false,error:'Masukkan nomor WhatsApp yang valid.'};
-    if (address.length < 8) return {ok:false,error:'Alamat pengiriman terlalu singkat.'};
-    const settings = S.get('settings');
+  const C = window.Crystal = window.Crystal || {};
+  const STATUSES = ['Menunggu konfirmasi', 'Diproses', 'Dikirim', 'Selesai', 'Dibatalkan'];
+  C.orderStatuses = STATUSES.slice();
+  C.orders = function () {
+    const rows = C.read(C.keys.orders, []);
+    return Array.isArray(rows) ? rows.filter(o => o && typeof o.id === 'string' && Array.isArray(o.items)).map(o => ({ ...o, total: Math.max(0, Number(o.total) || 0), status: STATUSES.includes(o.status) ? o.status : STATUSES[0] })) : [];
+  };
+  C.createOrder = function (customer) {
+    const cart = C.validateCart();
+    const name = String(customer.name || '').trim();
+    const phone = String(customer.phone || '').trim();
+    const address = String(customer.address || '').trim();
+    if (name.length < 2) throw new Error('Masukkan nama pelanggan yang valid.');
+    const digits = phone.replace(/\D/g, '');
+    if (digits.length < 8 || digits.length > 16) throw new Error('Nomor WhatsApp harus berisi 8–16 digit.');
+    if (address.length < 8) throw new Error('Alamat pengiriman terlalu singkat.');
+    const products = C.products();
+    // Recheck current stocks and subtract atomically in the same browser tab.
+    cart.forEach(row => {
+      const current = products.find(p => p.id === row.productId);
+      if (!current || current.stock < row.quantity || current.active !== true) throw new Error(`Stok ${row.product.name} berubah. Periksa kembali keranjang.`);
+    });
+    const items = cart.map(({ product, quantity }) => ({ productId: product.id, name: product.name, price: product.price, quantity, image: product.image || '', category: product.category }));
+    const total = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
     const order = {
-      id: 'SS-' + new Date().toISOString().slice(2,10).replace(/-/g,'') + '-' + Math.random().toString(36).slice(2,7).toUpperCase(),
-      createdAt: new Date().toISOString(), status: 'Menunggu konfirmasi',
-      customer: {name, phone, address, note:String(customer.note || '').trim()},
-      items: cart.items.map(i => ({productId:i.product.id, name:i.product.name, price:i.product.price, qty:i.qty, image:i.product.image || ''})),
-      subtotal: cart.subtotal, total: cart.subtotal, storeName: settings.storeName
+      id: C.id('CS'), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), status: STATUSES[0],
+      customer: { name: name.slice(0, 120), phone: phone.slice(0, 40), address: address.slice(0, 1500), note: String(customer.note || '').trim().slice(0, 2000) },
+      items, subtotal: total, shipping: 0, total, storageNote: 'Pesanan lokal pada browser ini; tidak terkirim ke server.'
     };
-    const saved = S.set('orders',[order,...all()]);
-    if (!saved) return {ok:false,error:'Pesanan tidak tersimpan di browser. Periksa penyimpanan perangkat.'};
-    // Inventory is adjusted only in this browser; this is not a central stock system.
-    const current = P.all();
-    order.items.forEach(item => { const p = current.find(p => p.id === item.productId); if (p) p.stock = Math.max(0, p.stock - item.qty); });
-    P.save(current);
-    C.clear();
-    window.dispatchEvent(new CustomEvent('sky:orders'));
-    return {ok:true,order};
-  }
-  function updateStatus(id, status) {
-    if (!STATUSES.includes(status)) return false;
-    const orders = all(), target = orders.find(o => o.id === id); if (!target) return false;
-    target.status = status; target.updatedAt = new Date().toISOString();
-    const ok = S.set('orders',orders); if (ok) window.dispatchEvent(new CustomEvent('sky:orders')); return ok;
-  }
-  function remove(id) { const next = all().filter(o => o.id !== id); const ok = S.set('orders',next); if (ok) window.dispatchEvent(new CustomEvent('sky:orders')); return ok; }
-  function stats() { const orders = all(); return { count:orders.length, waiting:orders.filter(o=>o.status==='Menunggu konfirmasi').length, processing:orders.filter(o=>o.status==='Diproses').length, delivered:orders.filter(o=>o.status==='Dikirim').length, completed:orders.filter(o=>o.status==='Selesai').length, total:orders.filter(o=>o.status!=='Dibatalkan').reduce((n,o)=>n+(Number(o.total)||0),0) }; }
-  function message(order) {
-    const s = S.get('settings');
-    const items = order.items.map(i => `• ${i.name} x${i.qty} — ${S.money(i.price*i.qty)}`).join('\n');
-    return `Halo ${s.storeName || 'Sky Shop'}, saya ingin mengonfirmasi pesanan berikut.\n\nNomor pesanan: ${order.id}\nNama: ${order.customer.name}\nWhatsApp: ${order.customer.phone}\nAlamat: ${order.customer.address}\n\nBarang:\n${items}\n\nSubtotal: ${S.money(order.subtotal)}\nTotal: ${S.money(order.total)}\nCatatan: ${order.customer.note || '-'}\n\nPesanan ini dibuat melalui website statis; mohon konfirmasi ketersediaan dan pembayaran.`;
-  }
-  window.SkyOrders = { STATUSES, all, byId, create, updateStatus, remove, stats, message };
+    const nextProducts = products.map(p => {
+      const matching = cart.find(row => row.productId === p.id);
+      return matching ? { ...p, stock: p.stock - matching.quantity, updatedAt: new Date().toISOString() } : p;
+    });
+    const newOrders = [order, ...C.orders()];
+    // If storage isn't working, don't tell the customer the order was saved.
+    if (!C.saveProducts(nextProducts)) throw new Error('Stok tidak dapat disimpan. Coba lagi setelah memeriksa penyimpanan browser.');
+    if (!C.write(C.keys.orders, newOrders)) { C.saveProducts(products); throw new Error('Pesanan tidak dapat disimpan di browser. Perubahan stok dibatalkan; periksa penyimpanan lalu coba lagi.'); }
+    C.clearCart();
+    return order;
+  };
+  C.updateOrderStatus = function (id, status) {
+    if (!STATUSES.includes(status)) throw new Error('Status pesanan tidak valid.');
+    const orders = C.orders();
+    const found = orders.find(o => o.id === String(id));
+    if (!found) throw new Error('Pesanan tidak ditemukan pada browser ini.');
+    found.status = status; found.updatedAt = new Date().toISOString();
+    return C.write(C.keys.orders, orders);
+  };
+  C.deleteOrder = id => C.write(C.keys.orders, C.orders().filter(o => o.id !== String(id)));
+  C.whatsappMessage = function (order) {
+    const settings = C.settings();
+    const lines = [
+      `Halo ${settings.storeName || 'toko'}, saya ingin mengirim detail pesanan.`,
+      `Nomor pesanan: ${order.id}`,
+      `Tanggal: ${C.formatDate(order.createdAt)}`,
+      '', 'Rincian barang:',
+      ...order.items.map((item, index) => `${index + 1}. ${item.name} x${item.quantity} — ${C.formatPrice(item.price * item.quantity)}`),
+      '', `Nama: ${order.customer.name}`, `WhatsApp pelanggan: ${order.customer.phone}`,
+      `Alamat: ${order.customer.address}`, `Subtotal: ${C.formatPrice(order.subtotal)}`, `Total: ${C.formatPrice(order.total)}`,
+      `Catatan: ${order.customer.note || '-'}`,
+      '', 'Catatan: pesanan ini dibuat melalui website statis; mohon konfirmasi ketersediaan dan pembayaran.'
+    ];
+    return lines.join('\n');
+  };
+  C.whatsappUrl = function (order) {
+    const digits = String(C.settings().whatsapp || '').replace(/\D/g, '');
+    if (!digits) return '';
+    return `https://wa.me/${digits}?text=${encodeURIComponent(C.whatsappMessage(order))}`;
+  };
 })();
